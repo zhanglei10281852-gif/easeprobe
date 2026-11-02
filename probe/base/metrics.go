@@ -25,11 +25,12 @@ import (
 
 // metrics is the probe metrics
 type metrics struct {
-	TotalCnt  *prometheus.GaugeVec
-	TotalTime *prometheus.GaugeVec
-	Duration  *prometheus.GaugeVec
-	Status    *prometheus.GaugeVec
-	SLA       *prometheus.GaugeVec
+	TotalCnt    *prometheus.GaugeVec
+	TotalTime   *prometheus.GaugeVec
+	Duration    *prometheus.GaugeVec
+	Status      *prometheus.GaugeVec
+	SLA         *prometheus.GaugeVec
+	Maintenance *prometheus.GaugeVec
 }
 
 // newMetrics create the metrics
@@ -46,5 +47,7 @@ func newMetrics(subsystem, name string, constLabels prometheus.Labels) *metrics 
 			"Probe Status", []string{"name", "endpoint"}, constLabels),
 		SLA: metric.NewGauge(namespace, subsystem, name, "sla",
 			"Probe SLA", []string{"name", "endpoint"}, constLabels),
+		Maintenance: metric.NewGauge(namespace, subsystem, name, "maintenance",
+			"Probe Maintenance Window Indicator", []string{"name", "endpoint", "reason"}, constLabels),
 	}
 }

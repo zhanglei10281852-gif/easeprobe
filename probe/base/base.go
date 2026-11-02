@@ -55,9 +55,17 @@ type DefaultProbe struct {
 	Labels                               prometheus.Labels `yaml:"labels,omitempty" json:"labels,omitempty" jsonschema:"title=Probe LabelMap,description=the labels of probe"`
 	global.StatusChangeThresholdSettings `yaml:",inline" json:",inline"`
 	global.NotificationStrategySettings  `yaml:"alert" json:"alert" jsonschema:"title=Probe Alert,description=the alert strategy of probe"`
+	Maintenance                          probe.MaintenanceSchedule `yaml:"maintenance,omitempty" json:"maintenance,omitempty" jsonschema:"title=Maintenance Windows,description=the optional absolute maintenance windows of the probe"`
 	ProbeFunc                            ProbeFuncType `yaml:"-" json:"-"`
 	ProbeResult                          *probe.Result `yaml:"-" json:"-"`
 	metrics                              *metrics      `yaml:"-" json:"-"`
+
+	// maintenanceWindows are the validated, sorted and merged maintenance
+	// windows of this probe.
+	maintenanceWindows []probe.MergedWindow `yaml:"-" json:"-"`
+	// wasInMaintenance records whether the previous probe started inside a
+	// maintenance window, it drives the threshold reset when leaving one.
+	wasInMaintenance bool `yaml:"-" json:"-"`
 }
 
 // LabelMap return the const metric labels  for a probe in the configuration.
@@ -156,6 +164,21 @@ func (d *DefaultProbe) Config(gConf global.ProbeSettings,
 	d.StatusChangeThresholdSettings = gConf.NormalizeThreshold(d.StatusChangeThresholdSettings)
 	d.NotificationStrategySettings = gConf.NormalizeNotificationStrategy(d.NotificationStrategySettings)
 
+	// validate and merge the optional maintenance windows.
+	mergedWindows, err := d.Maintenance.Normalize(global.GetEaseProbe().TimeLoc)
+	if err != nil {
+		log.Errorf("Probe %s has an invalid maintenance configuration: %v", d.LogTitle(), err)
+		return err
+	}
+	d.maintenanceWindows = mergedWindows
+	probe.RegisterMaintenance(name, mergedWindows)
+	if len(mergedWindows) > 0 {
+		for _, w := range mergedWindows {
+			log.Infof("Probe %s maintenance window: [%s ~ %s) %s", d.LogTitle(),
+				w.Start.Format(time.RFC3339), w.End.Format(time.RFC3339), w.Reason)
+		}
+	}
+
 	d.ProbeResult = probe.NewResultWithName(name)
 	d.ProbeResult.Name = name
 	d.ProbeResult.Endpoint = endpoint
@@ -194,13 +217,41 @@ func (d *DefaultProbe) Probe() probe.Result {
 		return *d.ProbeResult
 	}
 
+	// The maintenance ownership is decided by the instant the probe STARTS,
+	// a response returning across a window boundary never changes it.
 	now := time.Now().UTC()
 	d.ProbeResult.StartTime = now
 	d.ProbeResult.StartTimestamp = now.UnixMilli()
 
+	// The real probe always runs at the configured interval,
+	// even during a maintenance window.
 	stat, msg := d.ProbeFunc()
 
 	d.ProbeResult.RoundTripTime = time.Since(now)
+
+	// Keep the latest raw success/failure observation.
+	rawStatus := probe.StatusUp
+	if !stat {
+		rawStatus = probe.StatusDown
+	}
+	d.ProbeResult.LatestRawStatus = rawStatus
+
+	// A probe starting inside a maintenance window keeps the last confirmed
+	// service status and does not move any threshold, alert round, probe
+	// counter or SLA accounting.
+	if mw := probe.WindowAt(d.maintenanceWindows, now); mw != nil {
+		return d.probeInMaintenance(mw, rawStatus, msg)
+	}
+
+	// Leaving a continuous maintenance window: both the success and the
+	// failure thresholds re-accumulate from fresh out-of-window observations.
+	// The alert round progress (NotificationStrategyData) is kept untouched
+	// so a not-yet-recovered service continues its pre-maintenance progress.
+	if d.wasInMaintenance {
+		d.wasInMaintenance = false
+		d.ProbeResult.Stat.StatusCounter.Reset()
+	}
+	d.ProbeResult.Maintenance = nil
 
 	// check the status threshold
 	d.ProbeResult.Stat.StatusCounter.AppendStatus(stat, msg)
@@ -212,11 +263,7 @@ func (d *DefaultProbe) Probe() probe.Result {
 		d.ProbeResult.Stat.NotificationStrategyData.ProcessStatus(status == probe.StatusUp)
 	}
 
-	if len(d.ProbeTag) > 0 {
-		d.ProbeResult.Message = fmt.Sprintf("%s (%s/%s): %s", title, d.ProbeKind, d.ProbeTag, msg)
-	} else {
-		d.ProbeResult.Message = fmt.Sprintf("%s (%s): %s", title, d.ProbeKind, msg)
-	}
+	d.ProbeResult.Message = d.formatResultMessage(title, msg, "")
 
 	log.Debugf("%s - %s", d.LogTitle(), msg)
 
@@ -231,6 +278,42 @@ func (d *DefaultProbe) Probe() probe.Result {
 
 	result := d.ProbeResult.Clone()
 	return result
+}
+
+// probeInMaintenance handles a probe that started inside a maintenance window.
+// The raw observation (response message, RTT, raw status) is refreshed, but
+// the service status remains the last confirmed one and no accounting
+// (thresholds, alert rounds, valid probe counts, SLA up/down time) is moved.
+func (d *DefaultProbe) probeInMaintenance(mw *probe.MergedWindow, rawStatus probe.Status, msg string) probe.Result {
+	d.wasInMaintenance = true
+	d.ProbeResult.Maintenance = mw.State()
+
+	// The frozen result represents "no status transition": keep the last
+	// confirmed status and make PreStatus point at the same status. This is
+	// also what the threshold check falls back to when the first fresh
+	// out-of-window observation has not met the threshold yet.
+	d.ProbeResult.PreStatus = d.ProbeResult.Status
+
+	suffix := ""
+	if mw.Reason != "" {
+		suffix = " [maintenance: " + mw.Reason + "]"
+	}
+	d.ProbeResult.Message = d.formatResultMessage(rawStatus.Title(), msg, suffix)
+
+	log.Debugf("%s - %s (in maintenance, service state frozen: %s)%s",
+		d.LogTitle(), msg, d.ProbeResult.Status, suffix)
+
+	d.ExportMetrics()
+
+	return d.ProbeResult.Clone()
+}
+
+// formatResultMessage builds the human readable probe result message.
+func (d *DefaultProbe) formatResultMessage(title, msg, suffix string) string {
+	if len(d.ProbeTag) > 0 {
+		return fmt.Sprintf("%s (%s/%s): %s%s", title, d.ProbeKind, d.ProbeTag, msg, suffix)
+	}
+	return fmt.Sprintf("%s (%s): %s%s", title, d.ProbeKind, msg, suffix)
 }
 
 // ExportMetrics export the metrics
@@ -278,6 +361,22 @@ func (d *DefaultProbe) ExportMetrics() {
 		"name":     d.ProbeName,
 		"endpoint": d.ProbeResult.Endpoint,
 	}, d.Labels)).Set(float64(d.ProbeResult.SLAPercent()))
+
+	// The maintenance indicator is exported as an independent metric.
+	// All the metrics above keep their existing names, labels and semantics:
+	// they reflect the service status used for alerting and SLA, which stays
+	// frozen during a maintenance window.
+	inMaintenance := 0.0
+	reason := ""
+	if d.ProbeResult.Maintenance != nil && d.ProbeResult.Maintenance.Active {
+		inMaintenance = 1
+		reason = d.ProbeResult.Maintenance.Reason
+	}
+	d.metrics.Maintenance.With(metric.AddConstLabels(prometheus.Labels{
+		"name":     d.ProbeName,
+		"endpoint": d.ProbeResult.Endpoint,
+		"reason":   reason,
+	}, d.Labels)).Set(inMaintenance)
 }
 
 // DownTimeCalculation calculate the down time
@@ -290,7 +389,12 @@ func (d *DefaultProbe) DownTimeCalculation(status probe.Status) {
 
 	// Status from DOWN to UP - Recovery
 	if d.ProbeResult.PreStatus == probe.StatusDown && status == probe.StatusUp {
-		d.ProbeResult.RecoveryDuration = time.Since(d.ProbeResult.LatestDownTime)
+		now := time.Now().UTC()
+		duration := now.Sub(d.ProbeResult.LatestDownTime)
+		// Deduct the maintenance time between the two state transitions.
+		// The merged windows are disjoint, so any overlap is counted once only.
+		duration -= probe.OverlapDuration(d.maintenanceWindows, d.ProbeResult.LatestDownTime, now)
+		d.ProbeResult.RecoveryDuration = duration
 	}
 }
 

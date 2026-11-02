@@ -66,6 +66,16 @@ func (s *StatusCounter) AppendStatus(status bool, message string) {
 	}
 }
 
+// Reset clears the accumulated status history. It is used when a probe
+// leaves a (continuous) maintenance window: both the success and failure
+// thresholds must be re-accumulated from fresh out-of-window observations,
+// while the confirmed service status and the alert round progress are kept.
+func (s *StatusCounter) Reset() {
+	s.StatusHistory = make([]StatusHistory, 0, s.MaxLen)
+	s.CurrentStatus = true
+	s.StatusCount = 0
+}
+
 // SetMaxLen sets the max length of the status history
 func (s *StatusCounter) SetMaxLen(maxLen int) {
 	s.MaxLen = maxLen

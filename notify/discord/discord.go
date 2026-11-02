@@ -179,6 +179,13 @@ func (c *NotifyConfig) Notify(result probe.Result) {
 	tag := "Notification"
 
 	fn := func() error {
+		// status notifications obey the maintenance windows at every attempt:
+		// once the window starts, a failed send is not retried anymore.
+		if probe.IsInMaintenance(result.Name, time.Now().UTC()) {
+			log.Infof("[%s / %s / %s] - %s is under maintenance, the status notification is suppressed",
+				c.Kind(), c.NotifyName, tag, result.Name)
+			return &global.ErrNoRetry{Message: "the probe [" + result.Name + "] is under maintenance"}
+		}
 		return c.SendDiscordNotification(discord, tag)
 	}
 
@@ -300,6 +307,12 @@ func (c *NotifyConfig) NotifyStat(probers []probe.Prober) {
 
 // DryNotify just log the notification message
 func (c *NotifyConfig) DryNotify(result probe.Result) {
+	// even in dry run mode, status notifications obey the maintenance windows
+	if probe.IsInMaintenance(result.Name, time.Now().UTC()) {
+		log.Infof("[%s / %s] - %s is under maintenance, the dry status notification is suppressed",
+			c.Kind(), c.NotifyName, result.Name)
+		return
+	}
 	discord := c.NewDiscord(result)
 	json, err := json.Marshal(discord)
 	if err != nil {

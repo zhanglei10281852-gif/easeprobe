@@ -53,7 +53,9 @@ func (p *Ping) Config(gConf global.ProbeSettings) error {
 	kind := "ping"
 	tag := ""
 	name := p.ProbeName
-	p.DefaultProbe.Config(gConf, kind, tag, name, p.Host, p.DoProbe)
+	if err := p.DefaultProbe.Config(gConf, kind, tag, name, p.Host, p.DoProbe); err != nil {
+		return err
+	}
 
 	pinger := ping.New(p.Host)
 	if err := pinger.Resolve(); err != nil {

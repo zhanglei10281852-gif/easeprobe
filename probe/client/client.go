@@ -47,7 +47,9 @@ func (c *Client) Config(gConf global.ProbeSettings) error {
 	kind := "client"
 	tag := c.DriverType.String()
 	name := c.ProbeName
-	c.DefaultProbe.Config(gConf, kind, tag, name, c.Host, c.DoProbe)
+	if err := c.DefaultProbe.Config(gConf, kind, tag, name, c.Host, c.DoProbe); err != nil {
+		return err
+	}
 	if err := c.Check(); err != nil {
 		return err
 	}

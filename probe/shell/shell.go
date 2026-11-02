@@ -55,8 +55,10 @@ func (s *Shell) Config(gConf global.ProbeSettings) error {
 	kind := "shell"
 	tag := ""
 	name := s.ProbeName
-	s.DefaultProbe.Config(gConf, kind, tag, name,
-		global.CommandLine(s.Command, s.Args), s.DoProbe)
+	if err := s.DefaultProbe.Config(gConf, kind, tag, name,
+		global.CommandLine(s.Command, s.Args), s.DoProbe); err != nil {
+		return err
+	}
 
 	if err := s.TextChecker.Config(); err != nil {
 		return err

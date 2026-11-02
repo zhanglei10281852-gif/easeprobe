@@ -48,9 +48,16 @@ type Summary struct {
 
 // LatestProbe is the LatestProbe JSON structure
 type LatestProbe struct {
-	Time    time.Time    `json:"time"`
-	Status  probe.Status `json:"status"`
-	Message string       `json:"message"`
+	Time time.Time `json:"time"`
+	// RTT is the round trip time of the latest probe.
+	RTT time.Duration `json:"rtt"`
+	// Status is the service status used for alerting and SLA.
+	// It stays frozen at the last confirmed status during a maintenance window.
+	Status probe.Status `json:"status"`
+	// RawStatus is the raw success/failure result of the latest probe,
+	// it keeps being refreshed even during a maintenance window.
+	RawStatus probe.Status `json:"raw_status"`
+	Message   string       `json:"message"`
 }
 
 // SLA is the SLA JSON structure
@@ -60,6 +67,9 @@ type SLA struct {
 	Availability Availability `json:"sla"`
 	ProbeTimes   Summary      `json:"probe_summary"`
 	LatestProbe  LatestProbe  `json:"latest_probe"`
+	// Maintenance reports the maintenance state of the latest probe.
+	// It is omitted when the probe is not under maintenance.
+	Maintenance *probe.MaintenanceState `json:"maintenance,omitempty"`
 }
 
 // SLAObject covert the result to SLA struct
@@ -78,12 +88,40 @@ func SLAObject(r *probe.Result) SLA {
 			Down:  r.Stat.Status[probe.StatusDown] + r.Stat.Status[probe.StatusUnknown],
 		},
 		LatestProbe: LatestProbe{
-			Time:    r.StartTime,
-			Status:  r.Status,
-			Message: r.Message,
+			Time:      r.StartTime,
+			RTT:       r.RoundTripTime,
+			Status:    r.Status,
+			RawStatus: r.RawStat(),
+			Message:   r.Message,
 		},
+		Maintenance: r.Maintenance,
 	}
 
+}
+
+// inMaintenance reports whether the latest probe was under maintenance.
+func inMaintenance(r *probe.Result) bool {
+	return r.Maintenance != nil && r.Maintenance.Active
+}
+
+// rawDiverged reports whether the latest raw observation must be shown
+// separately from the service status.
+func rawDiverged(r *probe.Result) bool {
+	return inMaintenance(r) || r.RawStat() != r.Status
+}
+
+// maintenanceText renders a one-line, human readable maintenance summary.
+func maintenanceText(r *probe.Result) string {
+	if !inMaintenance(r) {
+		return ""
+	}
+	m := r.Maintenance
+	s := "Maintenance"
+	if m.Reason != "" {
+		s += ": " + m.Reason
+	}
+	s += " [" + FormatTime(m.Start) + " ~ " + FormatTime(m.End) + "]"
+	return s
 }
 
 // SLAJSONSection return the JSON format string to stat
@@ -115,11 +153,22 @@ func SLAJSON(probers []probe.Prober) string {
 // SLATextSection return the Text format string to stat
 func SLATextSection(r *probe.Result) string {
 	text := "Name: %s - %s, \n\tAvailability: Up - %s, Down - %s, SLA: %.2f%%\n\tProbe-Times: Total: %d ( %s ), \n\tLatest-Probe:%s - %s, Message:%s"
-	return fmt.Sprintf(text, r.Name, r.Endpoint,
+	args := []interface{}{
+		r.Name, r.Endpoint,
 		DurationStr(r.Stat.UpTime), DurationStr(r.Stat.DownTime), r.SLAPercent(),
 		r.Stat.Total, SLAStatusText(r.Stat, Text),
 		FormatTime(r.StartTime),
-		r.Status.Emoji()+" "+r.Status.String(), JSONEscape(r.Message))
+		r.Status.Emoji() + " " + r.Status.String(), JSONEscape(r.Message),
+	}
+	if m := maintenanceText(r); m != "" {
+		text += "\n\t" + m
+	}
+	if rawDiverged(r) {
+		raw := r.RawStat()
+		text += "\n\tLatest-Raw-Probe:%s - %s (the service status above is the one used for alerting and SLA)"
+		args = append(args, FormatTime(r.StartTime), raw.Emoji()+" "+raw.String())
+	}
+	return fmt.Sprintf(text, args...)
 }
 
 // SLAText return a full stat report
@@ -134,12 +183,26 @@ func SLAText(probers []probe.Prober) string {
 
 // SLALogSection return the Log format string to stat
 func SLALogSection(r *probe.Result) string {
-	text := `name="%s"; endpoint="%s"; up="%s"; down="%s"; sla="%.2f%%"; total="%d(%s)"; latest_time="%s"; latest_status="%s"; message="%s"`
-	return fmt.Sprintf(text, r.Name, r.Endpoint,
+	text := `name="%s"; endpoint="%s"; up="%s"; down="%s"; sla="%.2f%%"; total="%d(%s)"; latest_time="%s"; latest_status="%s";`
+	args := []interface{}{
+		r.Name, r.Endpoint,
 		DurationStr(r.Stat.UpTime), DurationStr(r.Stat.DownTime), r.SLAPercent(),
 		r.Stat.Total, SLAStatusText(r.Stat, Log),
 		FormatTime(r.StartTime),
-		r.Status.String(), r.Message)
+		r.Status.String(),
+	}
+	if rawDiverged(r) {
+		text += ` latest_raw_status="%s";`
+		args = append(args, r.RawStat().String())
+	}
+	if inMaintenance(r) {
+		text += ` maintenance="%s"; maintenance_start="%s"; maintenance_end="%s";`
+		m := r.Maintenance
+		args = append(args, m.Reason, FormatTime(m.Start), FormatTime(m.End))
+	}
+	text += ` message="%s"`
+	args = append(args, r.Message)
+	return fmt.Sprintf(text, args...)
 }
 
 // SLALog return a full stat report with Log format
@@ -166,11 +229,23 @@ func SLAMarkdownSection(r *probe.Result, f Format) string {
 		"- Latest-Probe: %s - %s \n" +
 		"  ```%s```\n"
 
-	return fmt.Sprintf(text, r.Name, r.Endpoint,
+	args := []interface{}{
+		r.Name, r.Endpoint,
 		DurationStr(r.Stat.UpTime), DurationStr(r.Stat.DownTime), r.SLAPercent(),
 		r.Stat.Total, SLAStatusText(r.Stat, MarkdownSocial),
 		FormatTime(r.StartTime),
-		r.Status.Emoji()+" "+r.Status.String(), r.Message)
+		r.Status.Emoji() + " " + r.Status.String(), r.Message,
+	}
+	if m := maintenanceText(r); m != "" {
+		text += "- Maintenance: `%s` \n"
+		args = append(args, m)
+	}
+	if rawDiverged(r) {
+		raw := r.RawStat()
+		text += "- Latest-Raw-Probe: %s - %s (the service status above is the one used for alerting and SLA) \n"
+		args = append(args, FormatTime(r.StartTime), raw.Emoji()+" "+raw.String())
+	}
+	return fmt.Sprintf(text, args...)
 }
 
 // SLAMarkdown return a full stat report with Markdown format
@@ -203,22 +278,51 @@ func SLAHTMLSection(r *probe.Result) string {
 	html := `
 	<tr>
 		<td class="head" colspan="3"><b>%s</b> - %s<td>
-	</tr>
+	</tr>`
+
+	if inMaintenance(r) {
+		html += `
+	<tr>
+		<td class="data" colspan="3" style="background:#fff3cd;"><b>&#128736; Maintenance</b>: %s<br><b>Window</b>: %s ~ %s</td>
+	</tr>`
+	}
+
+	html += `
 	<tr>
 		<td class="data"><b>Availability</b><br><b>Uptime: </b>%s,  <b>Downtime: </b>%s  </td>
 		<td class="data"><b>SLA<b><br>%.2f%%</td>
 		<td class="data"><b>Probe-Times</b><br><b>Total</b>: %d ( %s )</td>
 	</tr>
 	<tr>
-		<td  class="data" colspan="3"><b>Latest Probe</b>: %s - %s<br>%s<td>
+		<td  class="data" colspan="3"><b>Latest Probe</b>: %s<br>%s<td>
 	</tr>
 	`
-	return fmt.Sprintf(html, r.Name, r.Endpoint,
+
+	args := []interface{}{r.Name, r.Endpoint}
+	if inMaintenance(r) {
+		reason := r.Maintenance.Reason
+		if reason == "" {
+			reason = "-"
+		}
+		args = append(args, JSONEscape(reason), FormatTime(r.Maintenance.Start), FormatTime(r.Maintenance.End))
+	}
+
+	latestProbe := FormatTime(r.StartTime) + " - <b>Service Status</b>: " +
+		r.Status.Emoji() + " " + r.Status.String()
+	if rawDiverged(r) {
+		raw := r.RawStat()
+		latestProbe += "<br><b>Latest Raw Probe</b>: " + raw.Emoji() + " " +
+			raw.String() + " (the raw observation is not used for alerting and SLA during maintenance)"
+	}
+	latestProbe += "<br>" + JSONEscape(r.Message)
+
+	args = append(args,
 		DurationStr(r.Stat.UpTime), DurationStr(r.Stat.DownTime),
 		r.SLAPercent(),
 		r.Stat.Total, SLAStatusText(r.Stat, HTML),
-		FormatTime(r.StartTime),
-		r.Status.Emoji()+" "+r.Status.String(), JSONEscape(r.Message))
+		latestProbe)
+
+	return fmt.Sprintf(html, args...)
 }
 
 // SLAHTML return a full stat report
@@ -256,22 +360,45 @@ func SLASlackSection(r *probe.Result) string {
 				"type": "mrkdwn",
 				"text": "*%s* - %s` +
 		`\n>*Availability*\n>\t` + " *Up*:  `%s`  *Down* `%s`  -  *SLA*: `%.2f %%`" +
-		`\n>*Probe Times*\n>\t*Total* : %d ( %s )` +
-		`\n>*Latest Probe*\n>\t%s | %s` +
-		`\n>\t%s"` + `
-			}`
+		`\n>*Probe Times*\n>\t*Total* : %d ( %s)`
 
-	t := SlackTimeFormation(r.StartTime, "", global.GetTimeFormat())
+	args := []interface{}{
+		r.Name, JSONEscape(r.Endpoint),
+		DurationStr(r.Stat.UpTime), DurationStr(r.Stat.DownTime), r.SLAPercent(),
+		r.Stat.Total, SLAStatusText(r.Stat, MarkdownSocial),
+	}
+	if inMaintenance(r) {
+		jsonMsg += `\n>*Maintenance*\n>\t%s (%s ~ %s)`
+		reason := JSONEscape(r.Maintenance.Reason)
+		if reason == "" {
+			reason = "-"
+		}
+		args = append(args, reason,
+			SlackTimeFormation(r.Maintenance.Start, "", global.GetTimeFormat()),
+			SlackTimeFormation(r.Maintenance.End, "", global.GetTimeFormat()))
+	}
+
+	jsonMsg += `\n>*Latest Probe (Service Status)*\n>\t%s | %s`
+	args = append(args, SlackTimeFormation(r.StartTime, "", global.GetTimeFormat()),
+		r.Status.Emoji()+" "+r.Status.String())
+
+	if rawDiverged(r) {
+		raw := r.RawStat()
+		jsonMsg += `\n>*Latest Raw Probe*\n>\t%s | %s`
+		args = append(args, SlackTimeFormation(r.StartTime, "", global.GetTimeFormat()),
+			raw.Emoji()+" "+raw.String())
+	}
+
+	jsonMsg += `\n>\t%s"` + `
+			}`
 
 	message := JSONEscape(r.Message)
 	if r.Status != probe.StatusUp {
 		message = "`" + message + "`"
 	}
+	args = append(args, message)
 
-	output := fmt.Sprintf(jsonMsg, r.Name, JSONEscape(r.Endpoint),
-		DurationStr(r.Stat.UpTime), DurationStr(r.Stat.DownTime), r.SLAPercent(),
-		r.Stat.Total, SLAStatusText(r.Stat, MarkdownSocial),
-		t, r.Status.Emoji()+" "+r.Status.String(), message)
+	output := fmt.Sprintf(jsonMsg, args...)
 	if !json.Valid([]byte(output)) {
 		log.Errorf("SLASlackSection() for %s: invalid json: %s", r.Name, output)
 	}
@@ -376,21 +503,41 @@ func SLAStatusText(s probe.Stat, t Format) string {
 
 // SLALarkSection return the Text format string to stat
 func SLALarkSection(r *probe.Result) string {
+	// note: the content is embedded into a JSON string, so the "\n" below
+	// must stay literal backslash-n escapes instead of real newlines.
+	content := "**Name:** %s - %s\\n" +
+		"**Availability:** Up - %s, Down - %s\\n**SLA:** %.2f%%\\n" +
+		"**Probe-Times:** Total: %d ( %s )\\n"
+	args := []interface{}{
+		r.Name, r.Endpoint,
+		DurationStr(r.Stat.UpTime), DurationStr(r.Stat.DownTime), r.SLAPercent(),
+		r.Stat.Total, JSONEscape(SLAStatusText(r.Stat, Lark)),
+	}
+	if m := maintenanceText(r); m != "" {
+		content += "**Maintenance:** %s\\n"
+		args = append(args, JSONEscape(m))
+	}
+	content += "**Latest-Probe (Service Status):** %s - %s\\n"
+	args = append(args, FormatTime(r.StartTime), r.Status.Emoji()+" "+r.Status.String())
+	if rawDiverged(r) {
+		raw := r.RawStat()
+		content += "**Latest-Raw-Probe:** %s - %s\\n"
+		args = append(args, FormatTime(r.StartTime), raw.Emoji()+" "+raw.String())
+	}
+	content += "**Message:**%s"
+	args = append(args, JSONEscape(r.Message))
+
 	text := `
 	{
 		"tag": "hr"
 	}, {
 		"tag": "div",
 		"text": {
-		  "content": "**Name:** %s - %s\n**Availability:** Up - %s, Down - %s\n**SLA:** %.2f%%\n**Probe-Times:** Total: %d ( %s )\n**Latest-Probe:** %s - %s\n**Message:**%s",
+		  "content": "` + content + `",
 		  "tag": "lark_md"
 		}
 	},`
-	return fmt.Sprintf(text, r.Name, r.Endpoint,
-		DurationStr(r.Stat.UpTime), DurationStr(r.Stat.DownTime), r.SLAPercent(),
-		r.Stat.Total, JSONEscape(SLAStatusText(r.Stat, Lark)),
-		FormatTime(r.StartTime),
-		r.Status.Emoji()+" "+r.Status.String(), JSONEscape(r.Message))
+	return fmt.Sprintf(text, args...)
 }
 
 // SLALark return a full stat report
@@ -457,6 +604,10 @@ func SLASummary(probers []probe.Prober) string {
 
 // SLACSVSection set the CSV format for SLA
 func SLACSVSection(r *probe.Result) []string {
+	maintenance := ""
+	if inMaintenance(r) {
+		maintenance = maintenanceText(r)
+	}
 	return []string{
 		// Name, Endpoint,
 		r.Name, r.Endpoint,
@@ -464,17 +615,19 @@ func SLACSVSection(r *probe.Result) []string {
 		DurationStr(r.Stat.UpTime), DurationStr(r.Stat.DownTime), fmt.Sprintf("%.2f%%", r.SLAPercent()),
 		// ProbeSummary - Total( Up, Down)
 		fmt.Sprintf("%d(%s)", r.Stat.Total, SLAStatusText(r.Stat, Text)),
-		// LatestProbe, LatestStatus
+		// LatestProbe, Service Status (used for alerting and SLA)
 		FormatTime(r.StartTime), r.Status.String(),
 		// Message
 		r.Message,
+		// Maintenance window and latest raw observation
+		maintenance, r.RawStat().String(),
 	}
 }
 
 // SLACSV return a full stat report with CSV format
 func SLACSV(probers []probe.Prober) string {
 	data := [][]string{
-		{"Name", "Endpoint", "UpTime", "DownTime", "SLA", "ProbeSummary", "LatestProbe", "LatestStatus", "Message"},
+		{"Name", "Endpoint", "UpTime", "DownTime", "SLA", "ProbeSummary", "LatestProbe", "ServiceStatus", "Message", "Maintenance", "LatestRawStatus"},
 	}
 
 	for _, p := range probers {

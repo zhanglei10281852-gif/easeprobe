@@ -59,7 +59,9 @@ func (t *TLS) Config(gConf global.ProbeSettings) error {
 	kind := "tls"
 	tag := ""
 	name := t.ProbeName
-	t.DefaultProbe.Config(gConf, kind, tag, name, t.Host, t.DoProbe)
+	if err := t.DefaultProbe.Config(gConf, kind, tag, name, t.Host, t.DoProbe); err != nil {
+		return err
+	}
 
 	rootCaPem := []byte(t.RootCaPem)
 

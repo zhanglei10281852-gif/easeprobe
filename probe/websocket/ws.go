@@ -46,7 +46,9 @@ func (h *WebSocket) Config(gConf global.ProbeSettings) error {
 	kind := "websocket"
 	tag := ""
 	name := h.ProbeName
-	h.DefaultProbe.Config(gConf, kind, tag, name, h.URL, h.DoProbe)
+	if err := h.DefaultProbe.Config(gConf, kind, tag, name, h.URL, h.DoProbe); err != nil {
+		return err
+	}
 
 	url, err := url.Parse(h.URL)
 	if err != nil {

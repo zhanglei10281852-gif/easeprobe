@@ -50,6 +50,15 @@ type Result struct {
 	LatestDownTime   time.Time     `json:"latestdowntime" yaml:"latestdowntime"`
 	RecoveryDuration time.Duration `json:"recoverytime" yaml:"recoverytime"`
 	Stat             Stat          `json:"stat" yaml:"stat"`
+
+	// LatestRawStatus is the raw success/failure result of the latest probe.
+	// Unlike Status it is updated even during a maintenance window, so the
+	// latest raw observation can be distinguished from the service status
+	// used for alerting and SLA. Not persisted in the SLA data file.
+	LatestRawStatus Status `json:"raw_status,omitempty" yaml:"-"`
+	// Maintenance is the maintenance state of the latest probe.
+	// Not persisted in the SLA data file, it is rebuilt on every probe.
+	Maintenance *MaintenanceState `json:"maintenance,omitempty" yaml:"-"`
 }
 
 // NewResult return a Result object
@@ -112,7 +121,22 @@ func (r *Result) Clone() Result {
 	dst.LatestDownTime = r.LatestDownTime
 	dst.RecoveryDuration = r.RecoveryDuration
 	dst.Stat = r.Stat.Clone()
+	dst.LatestRawStatus = r.LatestRawStatus
+	if r.Maintenance != nil {
+		m := *r.Maintenance
+		dst.Maintenance = &m
+	}
 	return dst
+}
+
+// RawStat returns the raw success/failure status of the latest probe.
+// It falls back to the service status before the first probe was executed,
+// so callers never observe the uninitialized status by mistake.
+func (r *Result) RawStat() Status {
+	if r.LatestRawStatus != StatusInit {
+		return r.LatestRawStatus
+	}
+	return r.Status
 }
 
 // Clone return a clone of the Stat

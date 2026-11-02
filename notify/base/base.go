@@ -81,7 +81,40 @@ func (c *DefaultNotify) Notify(result probe.Result) {
 	title := result.Title()
 	message := report.FormatFuncs[c.NotifyFormat].ResultFn(result)
 
-	c.SendWithRetry(title, message, "Notification")
+	c.SendStatusWithRetry(result, title, message)
+}
+
+// maintenanceGate returns an ErrNoRetry while the probe of the result is
+// under maintenance. It applies to status (failure/recovery) notifications
+// only, the periodic SLA reports are never gated by it.
+// ErrNoRetry makes global.DoRetry stop immediately: a notification whose
+// send already started may finish, but it will not be retried once the
+// maintenance window has started.
+func (c *DefaultNotify) maintenanceGate(result probe.Result) error {
+	if mw := probe.CurrentMaintenanceWindow(result.Name, time.Now().UTC()); mw != nil {
+		log.Infof("[%s / %s / Notification] - %s is under maintenance, the status notification is suppressed (reason: %s)",
+			c.NotifyKind, c.NotifyName, result.Name, mw.Reason)
+		return &global.ErrNoRetry{Message: "the probe [" + result.Name + "] is under maintenance"}
+	}
+	return nil
+}
+
+// SendStatusWithRetry sends a probe status (failure/recovery) notification
+// with retry, the send is suppressed while the probe is under maintenance.
+func (c *DefaultNotify) SendStatusWithRetry(result probe.Result, title, message string) {
+	fn := func() error {
+		if err := c.maintenanceGate(result); err != nil {
+			return err
+		}
+		log.Debugf("[%s / %s / Notification] - %s", c.NotifyKind, c.NotifyName, title)
+		if c.NotifySendFunc == nil {
+			log.Errorf("[%s / %s / Notification] - %s SendFunc is nil", c.NotifyKind, c.NotifyName, title)
+			return &global.ErrNoRetry{Message: "SendFunc is nil"}
+		}
+		return c.NotifySendFunc(title, message)
+	}
+	err := global.DoRetry(c.NotifyKind, c.NotifyName, "Notification", c.Retry, fn)
+	report.LogSend(c.NotifyKind, c.NotifyName, "Notification", title, err)
 }
 
 // NotifyStat send the stat message into the email
@@ -111,6 +144,10 @@ func (c *DefaultNotify) SendWithRetry(title string, message string, tag string) 
 
 // DryNotify just log the notification message
 func (c *DefaultNotify) DryNotify(result probe.Result) {
+	// even in dry run mode, status notifications obey the maintenance windows
+	if err := c.maintenanceGate(result); err != nil {
+		return
+	}
 	log.Infof("[%s / %s / dry_notify] - %s", c.NotifyKind, c.NotifyName,
 		report.FormatFuncs[c.NotifyFormat].ResultFn(result))
 }

@@ -102,7 +102,9 @@ func (s *Server) Configure(gConf global.ProbeSettings,
 	kind, tag, name, endpoint string,
 	bastionMap *BastionMapType, fn base.ProbeFuncType) error {
 
-	s.DefaultProbe.Config(gConf, kind, tag, name, endpoint, fn)
+	if err := s.DefaultProbe.Config(gConf, kind, tag, name, endpoint, fn); err != nil {
+		return err
+	}
 
 	if len(s.Password) <= 0 && len(s.PrivateKey) <= 0 {
 		return fmt.Errorf("password or private key is required")

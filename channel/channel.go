@@ -21,6 +21,7 @@ package channel
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/megaease/easeprobe/notify"
 	"github.com/megaease/easeprobe/probe"
@@ -146,6 +147,16 @@ func (c *Channel) WatchEvent(wg *sync.WaitGroup) {
 			log.Infof("[%s / %s]: Received the done signal, channel exiting...", kind, c.Name)
 			return
 		case result := <-c.channel:
+			// Status notifications obey the maintenance windows at the time
+			// they would really be sent. An old failure/recovery notification
+			// still queued when a maintenance window starts is voided and must
+			// never be delivered (or replayed when the window ends).
+			if probe.IsInMaintenance(result.Name, time.Now().UTC()) {
+				log.Infof("[%s / %s]: %s (%s) is under maintenance, the queued status notification is voided, no notification.",
+					kind, c.Name, result.Name, result.Endpoint)
+				continue
+			}
+
 			// if it is the first time, and the status is UP, no need notify
 			if result.PreStatus == probe.StatusInit && result.Status == probe.StatusUp {
 				log.Debugf("[%s / %s]: %s (%s) - Initial Status [%s] == [%s], no notification.",
